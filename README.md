@@ -263,7 +263,7 @@ Works as-is. Unicode symbols in the plain-text fallback may not render correctly
 
 ## License
 
-MIT
+GNU GPLv3
 
 ---
 
