@@ -1,263 +1,272 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>LSCW - LiteSpeed Cache Warmer for any WordPress Site</title>
-    <style>
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-            line-height: 1.6;
-            color: #333;
-            max-width: 850px;
-            margin: 0 auto;
-            padding: 20px;
-            background-color: #fff;
-        }
-        h1, h2, h3 {
-            color: #111;
-            border-bottom: 1px solid #eaecef;
-            padding-bottom: 0.3em;
-        }
-        h1 { font-size: 2.25em; margin-bottom: 20px; }
-        h2 { font-size: 1.75em; margin-top: 24px; margin-bottom: 16px; }
-        h3 { font-size: 1.25em; margin-top: 24px; margin-bottom: 16px; border-bottom: none; }
-        p { margin-top: 0; margin-bottom: 16px; }
-        code {
-            font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, Courier, monospace;
-            background-color: #f6f8fa;
-            padding: 0.2em 0.4em;
-            border-radius: 3px;
-            font-size: 85%;
-        }
-        pre {
-            background-color: #f6f8fa;
-            padding: 16px;
-            border-radius: 6px;
-            overflow: auto;
-            font-size: 85%;
-            line-height: 1.45;
-        }
-        pre code {
-            background-color: transparent;
-            padding: 0;
-            font-size: 100%;
-        }
-        table {
-            border-collapse: collapse;
-            width: 100%;
-            margin-bottom: 16px;
-            margin-top: 10px;
-        }
-        table, th, td {
-            border: 1px solid #dfe2e5;
-        }
-        th, td {
-            padding: 8px 12px;
-            text-align: left;
-        }
-        th {
-            background-color: #f6f8fa;
-        }
-        ul, ol {
-            padding-left: 2em;
-            margin-top: 0;
-            margin-bottom: 16px;
-        }
-        li { margin-bottom: 4px; }
-        hr {
-            height: 0.25em;
-            padding: 0;
-            margin: 24px 0;
-            background-color: #e1e4e8;
-            border: 0;
-        }
-        blockquote {
-            margin: 0 0 16px 0;
-            padding: 0 1em;
-            color: #6a737d;
-            border-left: 0.25em solid #dfe2e5;
-        }
-    </style>
-</head>
-<body>
+# LSCW — LiteSpeed Cache Warmer
 
-    <h1>LiteSpeed Cache Warmer (LSCW)</h1>
-    <p>LSCW is a highly configurable CLI tool designed to pre-warm server-side caches on WordPress sites by simulating the complex "Guest Mode" and "Vary" architecture of LiteSpeed Cache (LSCache).</p>
-    <p>Unlike standard web crawlers that only fire superficial GET requests, LSCW processes and handles backend cookie exchanges and browser/device separations natively. This ensures both desktop and mobile cache splits are fully generated and stored on the server before actual users visit the page.</p>
+A command-line cache warming tool purpose-built for WordPress sites running the LiteSpeed Cache plugin. Rather than firing dumb HTTP requests and hoping for the best, LSCW replicates the exact warming sequence LiteSpeed itself performs: guest request → vary cookie acquisition → full privileged cache generation, with an optional mobile pass on top.
 
-    <hr>
+---
 
-    <h2>Cache Warming Algorithm (3-Phase Mechanism)</h2>
-    <p>LiteSpeed Cache relies on a strict cryptographic handshake to serve accurate cached variations. LSCW perfectly mimics this process for every single URL discovered:</p>
-    <ol>
-        <li>
-            <strong>Phase 1 (Initial Guest Visit & Discovery):</strong> 
-            Fires an initial <code>GET</code> request to the target URL utilizing standard desktop headers (<code>DESKTOP_HEADERS</code>). The script analyzes the <code>X-LiteSpeed-Cache</code> response header to map out the current state (<code>HIT</code>, <code>MISS</code>, or <code>NO-CACHE</code>) while simultaneously parsing the page source via regex to extract any inline vary hashes.
-        </li>
-        <li>
-            <strong>Phase 2 (Vary Handshake / AJAX Simulation):</strong> 
-            Dispatches a precise, structured <code>POST</code> payload (<code>LSCWP_CTRL=before_cloud_init</code>, <code>action=vary_update</code>) directly to the plugin's internal endpoint at <code>/wp-content/plugins/litespeed-cache/guest.vary.php</code>. This forces the backend server to generate and return a unique <code>_lscache_vary</code> cookie value mapped specifically to that asset.
-        </li>
-        <li>
-            <strong>Phase 3 (Full Cache and Variation Generation):</strong>
-            <ul>
-                <li>The newly acquired vary cookie is appended to the session headers, and a secondary <code>GET</code> request is sent to the URL, establishing a complete <strong>Masaüstü (Desktop) Full Cache</strong> file on disk.</li>
-                <li>If explicitly enabled (<code>--mobile</code>), the cookie string is manipulated to inject a <code>device:mobile</code> flag alongside <code>MOBILE_HEADERS</code> to trigger a third sequential request. This guarantees that the independent mobile cache variation is built concurrently.</li>
-            </ul>
-        </li>
-    </ol>
+## Why This Exists
 
-    <hr>
+LiteSpeed Cache distinguishes between a generic guest cache and a "varied" full cache keyed to a cookie (`_lscache_vary`). A naive warmer that simply GETs your URLs will populate the guest layer but never trigger the full cache — the one that actually serves your logged-out visitors at maximum speed. LSCW handles the full sequence correctly.
 
-    <h2>Architectural & Engineering Highlights</h2>
+---
 
-    <h3>1. Adaptive Delay Rate Limiting</h3>
-    <p>To protect target origins (especially shared hosting or budget VPS infrastructure) from thread fatigue and unexpected <code>429 Too Many Requests</code> errors, the engine employs a dynamic rate-limiting feedback loop:</p>
-    <ul>
-        <li><strong>Degradation State:</strong> If the engine encounters consecutive HTTP errors or a 429 status code across two iterations, the execution delay (<code>--delay</code>) automatically <strong>doubles</strong>, capping out at a maximum of 4x the original base configuration.</li>
-        <li><strong>Stabilization State:</strong> Once a consecutive streak of 10 successful requests is maintained, the controller assumes origin health has recovered and progressively compresses the sleep intervals down by **25%**, settling gradually toward the configured baseline.</li>
-    </ul>
+## Requirements
 
-    <h3>2. State Persistence & Fault Recovery (Checkpointing)</h3>
-    <p>State serialization runs asynchronously, mapping out unique state files for each distinct target (<code>.lscache_&lt;domain_name&gt;.checkpoint.json</code>). Progress is structural and gets committed automatically every 10 successful processing iterations. Passing the <code>--resume</code> flag dynamically loads this matrix, auto-skipping already-warmed assets during service recovery phases.</p>
+```
+Python 3.10+
+pip install requests lxml rich
+```
 
-    <h3>3. Intelligent Sitemap Compiling</h3>
-    <p>The parser utilizes a multi-tiered architecture that falls back gracefully to high-performance regex search routines if the system lacks compiled <code>lxml</code> libraries. To bypass aggressive Web Application Firewalls (WAFs) or security plugin locks, sitemap discovery operations are disguised under verified <code>Googlebot</code> User-Agent signatures.</p>
+`lxml` and `rich` are optional but strongly recommended. Without `lxml`, sitemap parsing falls back to regex. Without `rich`, the live dashboard is replaced by plain-text output. `requests` is mandatory.
 
-    <h3>4. Automated Retry Sub-Loops</h3>
-    <p>Transient connection drops or micro-downtimes do not break execution state. Any URLs dropping due to standard connection timeouts are captured inside a memory stack. Upon pool exhaustion, a dedicated secondary retry sequence sweeps these failures under safer conditions—injecting increased timeout ranges and padded, less aggressive delays.</p>
+---
 
-    <hr>
+## Installation
 
-    <h2>Installation</h2>
-    <p>Install the required baseline dependencies before initiating runtime scripts:</p>
-    <pre><code>pip install requests lxml rich</code></pre>
-    <blockquote>
-        <strong>Note:</strong> The <code>rich</code> library is strictly utilized for structural CLI tracking, drawing live progress panels and tabular layout maps. If executed inside bare environments lacking this dependency, the application seamlessly adapts down to <code>Plain log mode</code> over standard <code>stdout</code> loops without losing core logic components.
-    </blockquote>
+```bash
+git clone https://github.com/yourusername/lscw.git
+cd lscw
+pip install requests lxml rich
+```
 
-    hr
+No virtual environment required for typical use, but you can use one if you prefer.
 
-    <h2>CLI Reference & Parameter Overrides</h2>
-    <table>
-        <thead>
-            <tr>
-                <th>Argument</th>
-                <th>Type</th>
-                <th>Default</th>
-                <th>Description</th>
-            </tr>
-        </thead>
-        <tbody>
-            <tr>
-                <td><code>--site</code></td>
-                <td><code>str</code></td>
-                <td><em>Required</em></td>
-                <td>Base origin web URL to warm (e.g., <code>https://example.com</code>).</td>
-            </tr>
-            <tr>
-                <td><code>--sitemap</code></td>
-                <td><code>str</code></td>
-                <td><code>None</code></td>
-                <td>Explicit sitemap URI source. Auto-resolves to <code>&lt;site&gt;/sitemap.xml</code> if empty.</td>
-            </tr>
-            <tr>
-                <td><code>--urls-file</code></td>
-                <td><code>str</code></td>
-                <td><code>None</code></td>
-                <td>Path to a flat local plain-text file containing line-separated absolute target paths.</td>
-            </tr>
-            <tr>
-                <td><code>--workers</code></td>
-                <td><code>int</code></td>
-                <td><code>1</code></td>
-                <td>Allocated thread execution pool size (Concurrency level).</td>
-            </tr>
-            <tr>
-                <td><code>--delay</code></td>
-                <td><code>float</code></td>
-                <td><code>1.0</code></td>
-                <td>Base cool-down sleep sequence interval between major URL iterations (seconds).</td>
-            </tr>
-            <tr>
-                <td><code>--phase-delay</code></td>
-                <td><code>float</code></td>
-                <td><code>0.3</code></td>
-                <td>Micro-delays applied between consecutive sequential validation checks (Phase 1 → 2 → 3).</td>
-            </tr>
-            <tr>
-                <td><code>--mobile</code></td>
-                <td><code>flag</code></td>
-                <td><code>True</code></td>
-                <td>Toggles whether the execution loop maps independent mobile split-cache assets.</td>
-            </tr>
-            <tr>
-                <td><code>--timeout</code></td>
-                <td><code>int</code></td>
-                <td><code>30</code></td>
-                <td>Maximum connection allowance boundary thresholds per individual HTTP packet exchange.</td>
-            </tr>
-            <tr>
-                <td><code>--start-from</code></td>
-                <td><code>int</code></td>
-                <td><code>1</code></td>
-                <td>Slicing index override parameter (e.g., skip array positions and resume tracking at item 150).</td>
-            </tr>
-            <tr>
-                <td><code>--limit</code></td>
-                <td><code>int</code></td>
-                <td><code>None</code></td>
-                <td>Enforces a strict upper execution roof limit defining maximum URLs processed per loop.</td>
-            </tr>
-            <tr>
-                <td><code>--resume</code></td>
-                <td><code>flag</code></td>
-                <td><code>False</code></td>
-                <td>Instructs workers to load corresponding state sheets and skip past cataloged items.</td>
-            </tr>
-            <tr>
-                <td><code>--dry-run</code></td>
-                <td><code>flag</code></td>
-                <td><code>False</code></td>
-                <td>Compiles, reads, and lists collected target URLs to console screens without executing actual requests.</td>
-            </tr>
-        </tbody>
-    </table>
+---
 
-    <hr>
+## Quick Start
 
-    <h2>Production Scenarios & Sample Implementations</h2>
+```bash
+# Minimal — discovers your sitemap automatically
+python3 lscw.py --site https://yoursite.com
 
-    <h3>Safe Single-Thread Execution (Shared Hosting/Low-Spec Specs)</h3>
-    <p>Prevents noisy-neighbor alerts by locking concurrency limits down to a single worker while providing clean execution breathing windows across both desktop and mobile distributions:</p>
-    <pre><code>python3 lscw.py --site https://example.com --delay 1.5 --workers 1</code></pre>
+# With explicit sitemap
+python3 lscw.py --site https://yoursite.com --sitemap https://yoursite.com/sitemap_index.xml
 
-    <h3>Aggressive Performance Operations (Dedicated VDS / Premium Server Nodes)</h3>
-    <p>Spawns 4 concurrent workers interacting over multi-tier nested index tree sitemaps using aggressively lowered timing profiles:</p>
-    <pre><code>python3 lscw.py --site https://example.com --sitemap https://example.com/sitemap_index.xml --workers 4 --delay 0.2</code></pre>
+# Resume an interrupted run
+python3 lscw.py --site https://yoursite.com --resume
 
-    <h3>Resuming Interrupted Large Batches</h3>
-    <p>Recovering state context data smoothly across deep catalogs if connections drops occur mid-run:</p>
-    <pre><code>python3 lscw.py --site https://example.com --resume --workers 2</code></pre>
+# Preview URLs without touching the server
+python3 lscw.py --site https://yoursite.com --dry-run
 
-    <h3>Pre-Flight URL Evaluation (Dry Run)</h3>
-    <p>Validates extraction and target parsing logic without touching remote infrastructure endpoints:</p>
-    <pre><code>python3 lscw.py --site https://example.com --dry-run</code></pre>
+# Parallel workers on a VPS (not shared hosting)
+python3 lscw.py --site https://yoursite.com --workers 4 --delay 0.3
+```
 
-    <h3>Targeting Isolated Custom Datasets</h3>
-    <p>Restricting worker pipelines down to custom arrays read off localized system asset maps:</p>
-    <pre><code>python3 lscw.py --site https://example.com --urls-file high_traffic_urls.txt --workers 2</code></pre>
+---
 
-    <hr>
+## How the Warming Works
 
-    <h2>Output Metric Clarifications</h2>
-    <p>Technical definitions of the diagnostic metadata exposed during execution cycles:</p>
-    <ul>
-        <li><strong>Guest cache HIT / MISS:</strong> Cache profiling metrics capturing behavior for unauthenticated, freshly initializing client visits stripped of custom header histories.</li>
-        <li><strong>Full cache HIT / MISS:</strong> Profile definitions indicating storage behaviors for clients presenting valid, confirmed LiteSpeed vary structures.</li>
-        <li><strong>vary.php success:</strong> Represents operational success metrics of the backend interaction loop mapping endpoints at <code>/wp-content/.../guest.vary.php</code>. If this indicator continuously returns flat <code>0</code> values, verify that Guest Mode and optimization layers are explicitly enabled inside the parent WordPress installation.</li>
-    </ul>
+Each URL is processed in three consecutive phases. Understanding this is key to interpreting the output.
 
-</body>
-</html>
+**Phase 1 — Guest Request**
+A standard GET request using a full desktop browser User-Agent and headers (Chrome 124 on Windows). This hits the page cold, records whether it was a cache HIT or MISS, and extracts any inline `_lscache_vary` value embedded in the page source.
+
+**Phase 2 — Vary Cookie Acquisition**
+An AJAX POST is sent to `/wp-content/plugins/litespeed-cache/guest.vary.php` with `LSCWP_CTRL=before_cloud_init` and `action=vary_update`. This is exactly what LiteSpeed's frontend JavaScript does. The response sets the `_lscache_vary` cookie. LSCW checks three places for this cookie value: the response cookies, the `Set-Cookie` header, and the inline value extracted in Phase 1. If all three fail, it falls back to a static hash so the warming can continue.
+
+**Phase 3 — Full Cache Generation**
+The same URL is requested again, this time with the `_lscache_vary` cookie attached. This is what instructs LiteSpeed to store the page in the full, varied cache bucket. The response header `X-LiteSpeed-Cache` is read to determine HIT or MISS.
+
+**Phase 3b — Mobile Cache (optional)**
+If `--mobile` is active (the default), a fourth request is made using an iPhone User-Agent with the vary cookie modified to `device:mobile`. This populates the separate mobile cache variant that LiteSpeed maintains when mobile detection is enabled.
+
+A configurable pause (`--phase-delay`, default 0.3s) is inserted between each phase to avoid triggering rate limits on the same URL.
+
+---
+
+## All Parameters
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `--site` | string | **required** | Base URL of the site, e.g. `https://yoursite.com`. Trailing slash is stripped automatically. |
+| `--sitemap` | string | `{site}/sitemap.xml` | Explicit sitemap URL. Supports sitemap index files — LSCW will recursively parse all nested sitemaps. |
+| `--urls-file` | string | — | Path to a plain text file containing one URL per line. Lines not starting with `http` are silently skipped. When this is provided, `--sitemap` is ignored. |
+| `--delay` | float | `1.0` | Seconds to wait between URLs. This is the *base* value; the adaptive system adjusts it dynamically at runtime. |
+| `--phase-delay` | float | `0.3` | Seconds to wait between the phases of a single URL (guest → vary.php → full → mobile). Keeps individual URL bursts from looking like abuse. |
+| `--mobile` | flag | `True` | Warm the mobile cache variant in addition to desktop. Pass `--no-mobile` to disable if your site doesn't use mobile-specific caching. |
+| `--workers` | int | `1` | Number of parallel threads. On shared hosting, keep this at `1` or `2`. On a VPS, `4`–`8` is reasonable depending on your server. See the [concurrency note](#concurrency) below. |
+| `--timeout` | int | `30` | HTTP request timeout in seconds. On slow or resource-constrained servers, increase this to `60` or more to avoid false error counts. |
+| `--start-from` | int | `1` | 1-based index to start from in the URL list. Useful for skipping a known-good prefix without a checkpoint file. |
+| `--limit` | int | — | Maximum number of URLs to process. Applied after `--start-from`. Handy for testing on a subset before running the full list. |
+| `--resume` | flag | — | Load the checkpoint file for the site and skip any URLs already marked complete. See [checkpoint system](#checkpoint--resume) below. |
+| `--dry-run` | flag | — | Parse the sitemap (or URL file), print the full numbered URL list, and exit. No HTTP requests are made to the site. |
+
+---
+
+## URL Discovery
+
+**From sitemap (default)**
+
+LSCW fetches the sitemap using a Googlebot User-Agent (servers that block regular crawlers typically allow Googlebot). It detects `<loc>` entries ending in `.xml` as nested sitemaps and follows them recursively, so sitemap index files are handled transparently. Duplicate URLs across multiple sitemaps are deduplicated before warming begins.
+
+If no `--sitemap` is given, LSCW tries `{site}/sitemap.xml`. If that returns nothing or fails, the run is aborted with a clear error — you'll be told to use `--sitemap` or `--urls-file` explicitly.
+
+**From a text file**
+
+```bash
+python3 lscw.py --site https://yoursite.com --urls-file urls.txt
+```
+
+The file should have one absolute URL per line. Lines that don't start with `http` (blank lines, comments, etc.) are automatically skipped. URLs do not need to belong to the `--site` domain, though the vary cookie acquisition step uses `--site` as its origin.
+
+---
+
+## Adaptive Delay
+
+The delay between URLs isn't fixed — it responds to what the server is telling you.
+
+After every two consecutive errors or 429 responses, the delay doubles (up to `delay × 4`). After ten consecutive clean successes, it pulls back toward the base value. This means LSCW naturally backs off when a server is under load and speeds back up once it recovers, without you needing to intervene.
+
+The current delay value is shown live in the stats panel at the bottom of the terminal.
+
+---
+
+## Checkpoint & Resume
+
+Every 10 URLs (configurable in source via `CHECKPOINT_SAVE_EVERY`), LSCW writes a checkpoint file to disk named `.lscache_{domain}.checkpoint.json`. This file records all successfully processed URLs and a timestamp.
+
+```json
+{
+  "completed": [
+    "https://yoursite.com/page-one/",
+    "https://yoursite.com/page-two/"
+  ],
+  "saved_at": "2025-01-15T14:32:07.123456"
+}
+```
+
+When you run with `--resume`, LSCW loads this file, filters those URLs out of the current run, and logs how many were skipped. If you run without `--resume`, a new checkpoint is built from scratch.
+
+At the end of a successful run (zero errors), the checkpoint file is deleted automatically. If errors remain, it's kept so you can re-run with `--resume` and attempt those URLs again.
+
+The checkpoint file is placed in whatever directory you run the script from, not in a system location.
+
+---
+
+## Auto-Retry
+
+Any URL that produces an error during the main pass is collected and retried after the main loop finishes. The retry pass uses:
+
+- A fresh `requests.Session` with different retry settings (`backoff_factor=1.5` instead of `0.5`)
+- A timeout doubled from the configured value
+- A delay capped at `min(delay × 2, 5.0)` seconds between retries
+
+Successful retries are added to the checkpoint and the error count is decremented in the summary. The final summary table shows how many URLs were auto-retried.
+
+---
+
+## Concurrency
+
+With `--workers 1` (the default), LSCW processes URLs sequentially in the main thread. With `--workers N > 1`, it uses a `ThreadPoolExecutor` where each worker gets its own `requests.Session`. The adaptive delay and stats updates are protected by a thread lock.
+
+> **Shared hosting warning:** Most shared hosts throttle or block rapid parallel requests from a single IP. Start with `--workers 1` and only increase if your host can handle it. On shared hosting, a slow sequential run that completes is always better than a fast parallel run that gets your IP blocked mid-way.
+
+The progress bar and live table update correctly in both modes.
+
+---
+
+## Output & Live Dashboard
+
+When `rich` is installed, LSCW renders a live terminal dashboard with three components that refresh four times per second:
+
+- **Progress bar** — shows URL count (M of N), percentage, elapsed time, and ETA
+- **Results table** — a rolling window of the last 16 processed URLs, showing the URL (truncated), Guest status, vary.php success, Full cache status, and Mobile status
+- **Stats panel** — running totals for HIT/MISS/error counts, current delay, and per-URL timing
+
+Cache status values in the table:
+
+| Symbol | Meaning |
+|---|---|
+| `🔥 HIT` | The response was served from cache |
+| `📝 MISS` | The page was not cached; LiteSpeed will now cache it |
+| `🚫 N/C` | LiteSpeed explicitly set no-cache for this URL |
+| `─` | Phase was skipped (mobile when `--no-mobile`) |
+| `❌ ERR` | Request failed (timeout, connection error, etc.) |
+
+Without `rich`, LSCW falls back to a plain-text table printed line by line with timestamps, which works cleanly in log files and non-interactive environments.
+
+---
+
+## Summary Report
+
+At the end of every run, a summary table is printed:
+
+```
+╭─────────────────────────────────────╮
+│         📊  Result Summary          │
+│  Total URLs         147             │
+│  Total time         212.4s (1.4s/url)│
+│  vary.php success   147             │
+│  Guest cache HIT    12              │
+│  Guest cache MISS   135             │
+│  Full cache HIT     8               │
+│  Full cache MISS    139             │
+│  Auto-retried       3               │
+│  Errors             0               │
+╰─────────────────────────────────────╯
+```
+
+High MISS counts on the first run are expected and correct — that's the point. On a second run immediately after, you should see predominantly HITs.
+
+---
+
+## Source-Level Configuration
+
+A few constants near the top of `lscw.py` can be changed to tune behavior without modifying the CLI:
+
+```python
+MAX_TABLE_ROWS = 16
+```
+The number of rows shown in the rolling live table. Increase this on tall terminals, decrease it on small ones.
+
+```python
+CHECKPOINT_SAVE_EVERY = 10
+```
+How frequently (in URLs) the checkpoint is written to disk. Lower values reduce potential data loss on crashes; higher values reduce disk I/O.
+
+```python
+GUEST_VARY_PATH = "/wp-content/plugins/litespeed-cache/guest.vary.php"
+```
+The path to the LiteSpeed vary endpoint. This is standardized across all LiteSpeed Cache installations and should not need changing.
+
+```python
+# In warm_url(), Phase 2 fallback:
+vary_cookie_value = "78af7c1384f93507c535076013a0b18d"
+```
+If LSCW cannot obtain a vary cookie from the server through any of the three extraction methods, it falls back to this static hash. You can replace this with the actual `_lscache_vary` value from your site's cookies if you want a more precise fallback.
+
+The `DESKTOP_UA` and `MOBILE_UA` strings at the top of the file can be updated if you need to use different User-Agent values for your environment.
+
+---
+
+## Pre-Flight Check
+
+Before any warming begins, LSCW sends a single GET to `--site` and verifies a sub-500 response. If the site is unreachable, returns a 5xx, or times out, the run is aborted immediately. This prevents starting a long warm job against a server that's already down.
+
+---
+
+## Edge Cases
+
+**Site returns 429 (Too Many Requests)**
+LSCW detects 429 responses and treats them the same as errors for the purpose of the adaptive delay, causing it to back off. The URL is flagged and retried in the auto-retry pass.
+
+**Sitemap requires authentication**
+Use `--urls-file` instead. Export your URLs from a sitemap plugin, WP All Export, or Screaming Frog, save them to a text file, and pass it with `--urls-file`.
+
+**vary.php is unreachable**
+If the AJAX call to `guest.vary.php` fails completely (exception, not just a bad cookie), LSCW falls back to `"device:desktop"` as the vary value and continues. Warming will still occur; it just may not key to the exact vary hash your server expects. The `vary.php` column in the table will show `✗` for those URLs.
+
+**Running on Windows**
+Works as-is. Unicode symbols in the plain-text fallback may not render correctly in older Command Prompt windows; use Windows Terminal or run inside WSL for the best experience.
+
+---
+
+## License
+
+MIT
+
+---
+
+## Contributing
+
+Issues and pull requests are welcome. If you're adding support for a new cache plugin or URL discovery method, try to keep the phase structure intact so the output columns remain consistent.
