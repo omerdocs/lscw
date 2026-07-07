@@ -24,7 +24,7 @@ pip install requests lxml rich
 ## Installation
 
 ```bash
-git clone https://github.com/yourusername/lscw.git
+git clone https://github.com/omerdocs/lscw.git
 cd lscw
 pip install requests lxml rich
 ```
