@@ -242,6 +242,93 @@ def check_cache_status(headers: dict) -> str:
     if "no-cache" in lsc:  return "NO-CACHE"
     return "UNKNOWN"
 
+def looks_like_vary_hash(value: str | None) -> bool:
+    """
+    LiteSpeed serves _lscache_vary as an opaque hash derived from the site's
+    vary factors and salt. Anything plaintext ("device:desktop") or too short
+    is a placeholder, not a real vary key, and warming with it would fill a
+    phantom cache bucket no real visitor ever reads.
+    """
+    if not value:
+        return False
+    v = value.strip()
+    if len(v) < 8:
+        return False
+    if ":" in v or " " in v or "," in v:
+        return False
+    return re.fullmatch(r"[A-Za-z0-9_\-]+", v) is not None
+
+def clear_vary_cookie(session: requests.Session) -> None:
+    """
+    Phase 1 must be a genuinely cookie-less guest request. requests keeps a
+    session-wide jar, so a vary cookie set while warming URL N would otherwise
+    leak into the guest phase of URL N+1 and silently invalidate it.
+    """
+    jar = session.cookies
+    for c in list(jar):
+        if c.name == "_lscache_vary":
+            try:
+                jar.clear(c.domain, c.path, c.name)
+            except Exception:
+                pass
+
+def fetch_live_vary(
+    session: requests.Session,
+    site_base: str,
+    referer_url: str,
+    base_headers: dict,
+    timeout: int = 10,
+    inline_vary: str | None = None,
+) -> tuple[str | None, str | None]:
+    """
+    Asks guest.vary.php for the *current* vary cookie, mirroring what the
+    plugin's own JS does after page load. Returns (value, source) or
+    (None, None) — never a hardcoded fallback.
+
+    base_headers decides which variant we get: pass MOBILE_HEADERS and the
+    server hands back the mobile vary key, which is the only correct way to
+    warm the mobile bucket.
+    """
+    guest_vary_url = urljoin(site_base + "/", GUEST_VARY_PATH.lstrip("/"))
+    value: str | None = None
+    source: str | None = None
+
+    try:
+        r_vary = session.post(
+            guest_vary_url,
+            headers={
+                **base_headers,
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": referer_url,
+                "Origin": site_base,
+                "Sec-Fetch-Dest": "empty",
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Site": "same-origin",
+            },
+            data={
+                "LSCWP_CTRL": "before_cloud_init",
+                "action": "vary_update",
+                "referrer": referer_url,
+            },
+            timeout=timeout,
+        )
+        if "_lscache_vary" in r_vary.cookies:
+            value, source = r_vary.cookies["_lscache_vary"], "vary.php"
+        elif "Set-Cookie" in r_vary.headers:
+            m = re.search(r"_lscache_vary=([^;]+)", r_vary.headers.get("Set-Cookie", ""))
+            if m:
+                value, source = m.group(1), "set-cookie"
+    except Exception:
+        pass
+
+    if not looks_like_vary_hash(value) and inline_vary:
+        value, source = inline_vary, "inline"
+
+    if not looks_like_vary_hash(value):
+        return None, None
+    return value, source
+
 
 # ─── Core Logic ──────────────────────────────────────────────────────────────
 
@@ -254,11 +341,22 @@ def warm_url(
     delay_between_phases: float = 0.3,
 ) -> dict:
     """
-    Executes the 3-phase LiteSpeed cache warming process:
-    1. Initial Guest request (MISS)
-    2. AJAX request to guest.vary.php to acquire the privilege/vary cookie
-    3. Secondary request using the vary cookie to generate the full cached page
-    4. Optional mobile request using the mobile vary cookie
+    Warms only cache buckets that real visitors actually land in.
+
+    Desktop:
+      1. Cookie-less guest request  -> the default/guest bucket. This is where
+         first-time visitors and crawlers land, so it is the primary target and
+         is always warmed, whether or not a vary key can be obtained.
+      2. Live vary lookup via guest.vary.php.
+      3. If (and only if) a real vary key came back, a second request carrying
+         it -> the full/logged-vary bucket.
+
+    Mobile: the same two-step, using mobile UA end to end so the vary key we
+    get back is the mobile one.
+
+    There is deliberately no hardcoded vary fallback. If step 2 yields nothing,
+    step 3 is skipped and reported as NO-VARY rather than warming a bucket
+    keyed on a stale literal.
     """
     result: dict = {
         "url": url,
@@ -267,13 +365,16 @@ def warm_url(
         "phase2_status": "SKIP",
         "phase3_status": "SKIP",
         "vary_cookie": None,
+        "vary_source": None,
+        "mobile_guest_status": "SKIP",
+        "mobile_vary_ok": False,
         "has_error": False,
         "got_429": False,
+        "no_vary": False,
     }
 
-    guest_vary_url = urljoin(site_base, GUEST_VARY_PATH)
-
-    # Phase 1: Standard Guest Request
+    # ── Phase 1: cookie-less desktop guest request ───────────────────────────
+    clear_vary_cookie(session)
     try:
         r1 = session.get(url, headers=DESKTOP_HEADERS, timeout=timeout, allow_redirects=True)
         if r1.status_code == 429:
@@ -287,86 +388,81 @@ def warm_url(
 
     time.sleep(delay_between_phases)
 
-    # Phase 2: Vary Cookie Update via AJAX
-    vary_cookie_value: str | None = None
-    try:
-        r_vary = session.post(
-            guest_vary_url,
-            headers={
-                **DESKTOP_HEADERS,
-                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                "X-Requested-With": "XMLHttpRequest",
-                "Referer": url,
-                "Origin": site_base,
-                "Sec-Fetch-Dest": "empty",
-                "Sec-Fetch-Mode": "cors",
-                "Sec-Fetch-Site": "same-origin",
-            },
-            data={
-                "LSCWP_CTRL": "before_cloud_init",
-                "action": "vary_update",
-                "referrer": url,
-            },
-            timeout=10,
-        )
-        if "_lscache_vary" in r_vary.cookies:
-            vary_cookie_value = r_vary.cookies["_lscache_vary"]
-            result["guest_vary_ok"] = True
-        elif "Set-Cookie" in r_vary.headers:
-            m = re.search(r"_lscache_vary=([^;]+)", r_vary.headers.get("Set-Cookie", ""))
-            if m:
-                vary_cookie_value = m.group(1)
-                result["guest_vary_ok"] = True
+    # ── Phase 2: live desktop vary lookup ────────────────────────────────────
+    vary_value, vary_source = fetch_live_vary(
+        session, site_base, url, DESKTOP_HEADERS,
+        timeout=min(timeout, 15), inline_vary=inline_vary,
+    )
+    result["vary_cookie"] = vary_value
+    result["vary_source"] = vary_source
+    result["guest_vary_ok"] = vary_value is not None
 
-        if not vary_cookie_value and inline_vary:
-            vary_cookie_value = inline_vary
-            result["guest_vary_ok"] = True
-
-        if not vary_cookie_value:
-            vary_cookie_value = "78af7c1384f93507c535076013a0b18d" # Fallback hash
-    except Exception:
-        vary_cookie_value = "device:desktop"
-
-    result["vary_cookie"] = vary_cookie_value
-    time.sleep(delay_between_phases)
-
-    # Phase 3: Full Cache Generation using Vary Cookie
-    try:
-        r2 = session.get(
-            url,
-            headers={**DESKTOP_HEADERS},
-            cookies={"_lscache_vary": vary_cookie_value},
-            timeout=timeout,
-            allow_redirects=True,
-        )
-        if r2.status_code == 429:
-            result["got_429"] = True
-        result["phase2_status"] = check_cache_status(r2.headers)
-    except Exception:
-        result["phase2_status"] = "ERROR"
-        result["has_error"] = True
-
-    # Optional: Mobile Cache Generation
-    if warm_mobile:
+    # ── Phase 3: full desktop bucket, only with a real key ───────────────────
+    if vary_value is None:
+        result["phase2_status"] = "NO-VARY"
+        result["no_vary"] = True
+    else:
         time.sleep(delay_between_phases)
         try:
-            mob_cookie = vary_cookie_value.replace("device:desktop", "device:mobile")
-            if mob_cookie == vary_cookie_value:
-                mob_cookie = "device:mobile"
-            r3 = session.get(
+            clear_vary_cookie(session)
+            r2 = session.get(
                 url,
-                headers=MOBILE_HEADERS,
-                cookies={"_lscache_vary": mob_cookie},
+                headers=DESKTOP_HEADERS,
+                cookies={"_lscache_vary": vary_value},
                 timeout=timeout,
                 allow_redirects=True,
             )
-            if r3.status_code == 429:
+            if r2.status_code == 429:
                 result["got_429"] = True
-            result["phase3_status"] = check_cache_status(r3.headers)
+            result["phase2_status"] = check_cache_status(r2.headers)
         except Exception:
-            result["phase3_status"] = "ERROR"
+            result["phase2_status"] = "ERROR"
             result["has_error"] = True
 
+    # ── Mobile: cookie-less guest request, then its own vary key ─────────────
+    if warm_mobile:
+        time.sleep(delay_between_phases)
+        mob_inline = None
+        try:
+            clear_vary_cookie(session)
+            rm1 = session.get(url, headers=MOBILE_HEADERS, timeout=timeout, allow_redirects=True)
+            if rm1.status_code == 429:
+                result["got_429"] = True
+            result["mobile_guest_status"] = check_cache_status(rm1.headers)
+            mob_inline = get_vary_cookie_from_page(rm1.text)
+        except Exception:
+            result["mobile_guest_status"] = "ERROR"
+            result["has_error"] = True
+
+        time.sleep(delay_between_phases)
+        mob_vary, _ = fetch_live_vary(
+            session, site_base, url, MOBILE_HEADERS,
+            timeout=min(timeout, 15), inline_vary=mob_inline,
+        )
+        result["mobile_vary_ok"] = mob_vary is not None
+
+        if mob_vary is None:
+            # Mobile guest bucket is warm; the vary-keyed one stays untouched
+            # on purpose rather than being filled under a guessed key.
+            result["phase3_status"] = result["mobile_guest_status"]
+        else:
+            try:
+                clear_vary_cookie(session)
+                r3 = session.get(
+                    url,
+                    headers=MOBILE_HEADERS,
+                    cookies={"_lscache_vary": mob_vary},
+                    timeout=timeout,
+                    allow_redirects=True,
+                )
+                if r3.status_code == 429:
+                    result["got_429"] = True
+                result["phase3_status"] = check_cache_status(r3.headers)
+            except Exception:
+                result["phase3_status"] = "ERROR"
+                result["has_error"] = True
+
+    clear_vary_cookie(session)
     return result
 
 
@@ -377,6 +473,7 @@ def _status_cell(s: str) -> "Text":
     if s == "MISS":      return Text("📝 MISS",   style="yellow")
     if s == "SKIP":      return Text("─",          style="dim")
     if s == "NO-CACHE":  return Text("🚫 N/C",    style="dim red")
+    if s == "NO-VARY":   return Text("⚠ NOVARY", style="bold yellow")
     if "ERROR" in s:     return Text("❌ ERR",    style="bold red")
     return Text(s[:8],                              style="dim")
 
@@ -420,6 +517,7 @@ def _build_stats_panel(stats: dict, elapsed: float, delay: float) -> "Panel":
         f"   [yellow]📝 MISS[/yellow]  "
         f"Guest [bold]{stats['guest_miss']}[/bold]  Full [bold]{stats['full_miss']}[/bold]"
         f"   [cyan]vary✓ [bold]{stats['vary_ok']}[/bold][/cyan]"
+        f"   [yellow]novary [bold]{stats.get('no_vary', 0)}[/bold][/yellow]"
         f"   [red]Error [bold]{stats['errors']}[/bold][/red]"
         f"   [dim]⏱ {ppu:.1f}s/url  delay {delay:.1f}s[/dim]"
     )
@@ -437,7 +535,7 @@ def run_warming(
 
     total   = len(urls)
     stats   = {"guest_hit": 0, "guest_miss": 0, "full_hit": 0, "full_miss": 0,
-               "errors": 0, "vary_ok": 0}
+               "errors": 0, "vary_ok": 0, "no_vary": 0}
     all_results: list[dict] = []
     recent_rows: list[dict] = []
     start_time = time.time()
@@ -452,6 +550,7 @@ def run_warming(
             if p2 == "HIT":           stats["full_hit"] += 1
             elif p2 == "MISS":        stats["full_miss"] += 1
             if result["guest_vary_ok"]: stats["vary_ok"] += 1
+            if result.get("no_vary"): stats["no_vary"] += 1
             if result["has_error"]:   stats["errors"] += 1
             all_results.append(result)
             recent_rows.append(result)
@@ -594,6 +693,9 @@ def _print_summary(stats: dict, total: int, elapsed: float, retried: int = 0) ->
         t.add_row("Total URLs",        str(total))
         t.add_row("Total time",        f"{elapsed:.1f}s  ({elapsed/max(total,1):.1f}s/url)")
         t.add_row("vary.php success",  str(stats["vary_ok"]))
+        nv = stats.get("no_vary", 0)
+        t.add_row("No vary key (skipped)",
+                  f"[yellow]{nv}[/yellow]" if nv else "[green]0[/green]")
         t.add_row("Guest cache HIT",   f"[green]{stats['guest_hit']}[/green]")
         t.add_row("Guest cache MISS",  f"[yellow]{stats['guest_miss']}[/yellow]")
         t.add_row("Full cache HIT",    f"[green]{stats['full_hit']}[/green]")
@@ -608,7 +710,7 @@ def _print_summary(stats: dict, total: int, elapsed: float, retried: int = 0) ->
         print("  RESULT SUMMARY")
         print(f"{'='*60}")
         print(f"  Total    : {total}    Time: {elapsed:.1f}s ({elapsed/max(total,1):.1f}s/url)")
-        print(f"  vary.php : {stats['vary_ok']}")
+        print(f"  vary.php : {stats['vary_ok']}   no-vary: {stats.get('no_vary', 0)}")
         print(f"  Guest    : HIT {stats['guest_hit']}  MISS {stats['guest_miss']}")
         print(f"  Full     : HIT {stats['full_hit']}  MISS {stats['full_miss']}")
         if retried:
@@ -629,7 +731,8 @@ def main() -> None:
     parser.add_argument("--urls-file",                                     help="Text file containing URLs line by line")
     parser.add_argument("--delay",       type=float, default=1.0,          help="Delay between URLs in seconds (default: 1.0)")
     parser.add_argument("--phase-delay", type=float, default=0.3,          help="Delay between phases in seconds (default: 0.3)")
-    parser.add_argument("--mobile",      action="store_true", default=True, help="Also warm up mobile cache (default: True)")
+    parser.add_argument("--no-mobile",   dest="mobile", action="store_false", default=True,
+                                                                       help="Skip mobile cache warming (mobile is on by default)")
     parser.add_argument("--workers",     type=int,   default=1,            help="Number of parallel workers (shared hosting: 1-2)")
     parser.add_argument("--timeout",     type=int,   default=30,           help="HTTP timeout in seconds (default: 30)")
     parser.add_argument("--start-from",  type=int,   default=1,            help="URL index to start from (default: 1)")
@@ -760,6 +863,7 @@ def main() -> None:
             if p2 == "HIT":       stats["full_hit"] += 1
             elif p2 == "MISS":    stats["full_miss"] += 1
             if r["guest_vary_ok"]: stats["vary_ok"] += 1
+            if r.get("no_vary"): stats["no_vary"] += 1
             if ok:
                 stats["errors"] = max(0, stats["errors"] - 1)
                 checkpoint_set.add(url)
@@ -780,6 +884,13 @@ def main() -> None:
             pass
 
     _print_summary(stats, len(urls), elapsed, retried=retried_count)
+
+    nv = stats.get("no_vary", 0)
+    if nv:
+        log("WARN",
+            f"{nv} URL could not obtain a live vary key; their vary-keyed bucket was "
+            f"left cold on purpose. Guest bucket is still warm. Check that Guest Mode "
+            f"and guest.vary.php are reachable ({GUEST_VARY_PATH}).")
 
 
 if __name__ == "__main__":
