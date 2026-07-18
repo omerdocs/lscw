@@ -1,0 +1,7 @@
+# Python
+__pycache__/
+*.pyc
+
+# LSCW runtime files
+.lscache_*.checkpoint.json
+.lscache_*.checkpoint.json.tmp
