@@ -277,7 +277,7 @@ With `--workers N` (clamped to 16), a thread pool takes over:
 With `rich` installed, LSCW renders a structured live view built from titled panels:
 
 ```
-╭─ LSCW · LiteSpeed Cache Warmer v1.0.0 ─────────────────────────────╮
+╭─ LSCW · LiteSpeed Cache Warmer v1.1.0 ─────────────────────────────╮
 │  site         https://yoursite.com     sitemap ua   googlebot      │
 │  delay        1.0s (adaptive)          workers      1              │
 │  phase delay  0.3s                     timeout      30s            │
