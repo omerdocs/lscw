@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 import requests
 
 from . import __version__
-from .config import GUEST_VARY_PATH, MAX_WORKERS, SITEMAP_UAS
+from .config import BROTLI_AVAILABLE, GUEST_VARY_PATH, MAX_WORKERS, SITEMAP_UAS, VARY_MODES
 from .network import make_session, parse_sitemap, pre_run_check
 from .runner import run_warming
 from .state import AdaptiveDelay, checkpoint_path, load_checkpoint, save_checkpoint
@@ -26,11 +26,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--site",        required=True,                    help="Site URL (e.g., https://mysite.com)")
     parser.add_argument("--sitemap",                                       help="Sitemap URL. If not specified, <site>/sitemap.xml is tried")
-    parser.add_argument("--sitemap-ua",  choices=list(SITEMAP_UAS), default="googlebot",
-                                                                       help="UA for sitemap fetching. 'googlebot' bypasses some bot protections, 'browser' uses a normal Chrome UA (default: googlebot)")
+    parser.add_argument("--sitemap-ua",  choices=list(SITEMAP_UAS), default="browser",
+                                                                       help="UA for sitemap fetching. 'browser' uses a normal Chrome UA; 'googlebot' may get past some bot rules but is blocked where Googlebot is verified (default: browser)")
     parser.add_argument("--urls-file",                                     help="Text file containing URLs line by line")
     parser.add_argument("--delay",       type=float, default=1.0,          help="Delay between URLs in seconds (default: 1.0)")
     parser.add_argument("--phase-delay", type=float, default=0.3,          help="Delay between phases in seconds (default: 0.3)")
+    parser.add_argument("--vary",        choices=VARY_MODES, default="auto",
+                                                                       help="Vary-keyed phases: 'auto' runs them only when the page carries LiteSpeed's Guest Mode script, 'on' always, 'off' never (default: auto)")
     parser.add_argument("--no-mobile",   dest="mobile", action="store_false", default=True,
                                                                        help="Skip mobile cache warming (mobile is on by default)")
     parser.add_argument("--workers",     type=int,   default=1,            help=f"Number of parallel workers, max {MAX_WORKERS} (shared hosting: 1-2)")
@@ -57,6 +59,8 @@ def banner_rows(args, site_base: str) -> list[tuple[str, str]]:
         ("timeout",     f"{args.timeout}s"),
         ("mobile",      "on" if args.mobile else "off"),
         ("resume",      "on" if args.resume else "off"),
+        ("vary",        args.vary),
+        ("brotli",      "on" if BROTLI_AVAILABLE else "off"),
     ]
 
 
@@ -114,6 +118,7 @@ def retry_failed(args, site_base: str, results_by_url: dict, checkpoint_set: set
                 warm_mobile=args.mobile,
                 timeout=args.timeout * 2,
                 delay_between_phases=args.phase_delay,
+                vary_mode=args.vary,
             )
             retried_count += 1
             results_by_url[url] = r
@@ -232,8 +237,21 @@ def main() -> None:
     if stats["no_vary"]:
         log("WARN",
             f"{stats['no_vary']} URL could not obtain a live vary key; their vary-keyed bucket was "
-            f"left cold on purpose. Guest bucket is still warm. Check that Guest Mode "
-            f"and guest.vary.php are reachable ({GUEST_VARY_PATH}).")
+            f"left cold on purpose. Guest bucket is still warm. Check that "
+            f"guest.vary.php is reachable ({GUEST_VARY_PATH}).")
+
+    if args.vary == "auto" and stats["guest_off"] and not stats["guest_on"]:
+        log("INFO",
+            "LiteSpeed Guest Mode not detected — vary phases skipped. Without it no visitor "
+            "gets a vary cookie, so the guest bucket is the only one to warm.")
+    elif args.vary == "auto" and stats["guest_off"]:
+        log("INFO", f"Guest Mode script missing on {stats['guest_off']} URLs — vary phases skipped there.")
+
+    if args.mobile and stats["mobile_shared"]:
+        log("INFO",
+            f"{stats['mobile_shared']} URLs: the mobile request hit the copy the desktop request had just "
+            f"stored, so mobile and desktop share one bucket (LiteSpeed 'Cache Mobile' looks off). "
+            f"--no-mobile halves the request count.")
 
     if interrupted:
         sys.exit(130)

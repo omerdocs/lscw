@@ -8,7 +8,7 @@ from urllib.parse import urljoin, urlparse
 
 import requests
 
-from .config import DESKTOP_HEADERS, GUEST_VARY_PATH, MOBILE_HEADERS
+from .config import DESKTOP_HEADERS, GUEST_SCRIPT_RE, GUEST_VARY_PATH, MOBILE_HEADERS
 from .utils import same_host
 
 
@@ -22,6 +22,24 @@ def check_cache_status(headers: dict) -> str:
 
 def http_error_label(status_code: int) -> str | None:
     return f"E{status_code}" if status_code >= 400 else None
+
+
+def detect_guest_mode(html_text: str | None) -> bool:
+    """True when the page carries LiteSpeed's Guest Mode script.
+
+    Only that script makes a real browser call guest.vary.php. Without it no
+    visitor ever holds a guest vary cookie, and requests carrying one are not
+    cached at all — warming them would only burn uncached page renders.
+    """
+    return bool(html_text) and GUEST_SCRIPT_RE.search(html_text) is not None
+
+
+def should_vary(vary_mode: str, guest_detected: bool) -> bool:
+    if vary_mode == "on":
+        return True
+    if vary_mode == "off":
+        return False
+    return guest_detected
 
 
 def get_vary_cookie_from_page(html_text: str) -> str | None:
@@ -124,6 +142,8 @@ def empty_result(url: str) -> dict:
         "vary_cookie": None,
         "vary_source": None,
         "mobile_vary_ok": False,
+        "guest_mode": None,
+        "mobile_shared": False,
         "has_error": False,
         "got_429": False,
         "no_vary": False,
@@ -144,11 +164,14 @@ def warm_url(
     warm_mobile: bool = True,
     timeout: int = 30,
     delay_between_phases: float = 0.3,
+    vary_mode: str = "auto",
 ) -> dict:
     """
     Warms only cache buckets that real visitors actually land in:
       1. Cookie-less guest request  → guest bucket (always warmed).
-      2. Live vary lookup via guest.vary.php.
+      2. Live vary lookup via guest.vary.php — only when the page carries
+         LiteSpeed's Guest Mode script (vary_mode="auto"), or when forced
+         with vary_mode="on". Otherwise the phase is reported as OFF.
       3. Only with a real vary key → full bucket. No hardcoded fallback:
          a missing key is reported as NO-VARY instead of warming a stale bucket.
     Mobile repeats the same flow with the mobile UA end to end.
@@ -176,49 +199,53 @@ def warm_url(
         return result
 
     result["phase1_status"] = check_cache_status(r1.headers)
-    inline_vary = get_vary_cookie_from_page(r1.text)
-
-    time.sleep(delay_between_phases)
+    page_text = r1.text
+    result["guest_mode"] = detect_guest_mode(page_text)
+    inline_vary = get_vary_cookie_from_page(page_text)
 
     # ── Phase 2: live desktop vary lookup ────────────────────────────────────
-    vary_value, vary_source = fetch_live_vary(
-        session, site_base, url, DESKTOP_HEADERS,
-        timeout=min(timeout, 15), inline_vary=inline_vary,
-    )
-    result["vary_cookie"] = vary_value
-    result["vary_source"] = vary_source
-    result["guest_vary_ok"] = vary_value is not None
-
-    # ── Phase 3: full desktop bucket, only with a real key ───────────────────
-    if vary_value is None:
-        result["phase2_status"] = "NO-VARY"
-        result["no_vary"] = True
+    if not should_vary(vary_mode, result["guest_mode"]):
+        result["phase2_status"] = "OFF"
     else:
         time.sleep(delay_between_phases)
-        try:
-            clear_vary_cookie(session)
-            r2 = session.get(
-                url,
-                headers=DESKTOP_HEADERS,
-                cookies={"_lscache_vary": vary_value},
-                timeout=timeout,
-                allow_redirects=True,
-            )
-            err = http_error_label(r2.status_code)
-            if err:
-                result["phase2_status"] = err
-                result["got_429"] = result["got_429"] or r2.status_code == 429
+        vary_value, vary_source = fetch_live_vary(
+            session, site_base, url, DESKTOP_HEADERS,
+            timeout=min(timeout, 15), inline_vary=inline_vary,
+        )
+        result["vary_cookie"] = vary_value
+        result["vary_source"] = vary_source
+        result["guest_vary_ok"] = vary_value is not None
+
+        # ── Phase 3: full desktop bucket, only with a real key ───────────────
+        if vary_value is None:
+            result["phase2_status"] = "NO-VARY"
+            result["no_vary"] = True
+        else:
+            time.sleep(delay_between_phases)
+            try:
+                clear_vary_cookie(session)
+                r2 = session.get(
+                    url,
+                    headers=DESKTOP_HEADERS,
+                    cookies={"_lscache_vary": vary_value},
+                    timeout=timeout,
+                    allow_redirects=True,
+                )
+                err = http_error_label(r2.status_code)
+                if err:
+                    result["phase2_status"] = err
+                    result["got_429"] = result["got_429"] or r2.status_code == 429
+                    result["has_error"] = True
+                else:
+                    result["phase2_status"] = check_cache_status(r2.headers)
+            except requests.RequestException:
+                result["phase2_status"] = "ERROR"
                 result["has_error"] = True
-            else:
-                result["phase2_status"] = check_cache_status(r2.headers)
-        except requests.RequestException:
-            result["phase2_status"] = "ERROR"
-            result["has_error"] = True
 
     # ── Mobile: cookie-less guest request, then its own vary key ─────────────
     if warm_mobile:
         time.sleep(delay_between_phases)
-        mob_inline = None
+        mob_text = None
         mobile_guest_ok = False
         try:
             clear_vary_cookie(session)
@@ -230,42 +257,52 @@ def warm_url(
                 result["has_error"] = True
             else:
                 result["mobile_guest_status"] = check_cache_status(rm1.headers)
-                mob_inline = get_vary_cookie_from_page(rm1.text)
+                mob_text = rm1.text
                 mobile_guest_ok = True
         except requests.RequestException:
             result["mobile_guest_status"] = "ERROR"
             result["has_error"] = True
 
-        if mobile_guest_ok:
-            time.sleep(delay_between_phases)
-            mob_vary, _ = fetch_live_vary(
-                session, site_base, url, MOBILE_HEADERS,
-                timeout=min(timeout, 15), inline_vary=mob_inline,
-            )
-            result["mobile_vary_ok"] = mob_vary is not None
+        # The desktop request just stored this page; an immediate mobile HIT
+        # means both share one copy (LiteSpeed's "Cache Mobile" is off).
+        result["mobile_shared"] = (
+            result["phase1_status"] == "MISS" and result["mobile_guest_status"] == "HIT"
+        )
 
-            if mob_vary is None:
-                result["phase3_status"] = "NO-VARY"
+        if mobile_guest_ok:
+            if not should_vary(vary_mode, detect_guest_mode(mob_text)):
+                result["phase3_status"] = "OFF"
             else:
-                try:
-                    clear_vary_cookie(session)
-                    r3 = session.get(
-                        url,
-                        headers=MOBILE_HEADERS,
-                        cookies={"_lscache_vary": mob_vary},
-                        timeout=timeout,
-                        allow_redirects=True,
-                    )
-                    err = http_error_label(r3.status_code)
-                    if err:
-                        result["phase3_status"] = err
-                        result["got_429"] = result["got_429"] or r3.status_code == 429
+                time.sleep(delay_between_phases)
+                mob_vary, _ = fetch_live_vary(
+                    session, site_base, url, MOBILE_HEADERS,
+                    timeout=min(timeout, 15), inline_vary=get_vary_cookie_from_page(mob_text or ""),
+                )
+                result["mobile_vary_ok"] = mob_vary is not None
+
+                if mob_vary is None:
+                    result["phase3_status"] = "NO-VARY"
+                else:
+                    time.sleep(delay_between_phases)
+                    try:
+                        clear_vary_cookie(session)
+                        r3 = session.get(
+                            url,
+                            headers=MOBILE_HEADERS,
+                            cookies={"_lscache_vary": mob_vary},
+                            timeout=timeout,
+                            allow_redirects=True,
+                        )
+                        err = http_error_label(r3.status_code)
+                        if err:
+                            result["phase3_status"] = err
+                            result["got_429"] = result["got_429"] or r3.status_code == 429
+                            result["has_error"] = True
+                        else:
+                            result["phase3_status"] = check_cache_status(r3.headers)
+                    except requests.RequestException:
+                        result["phase3_status"] = "ERROR"
                         result["has_error"] = True
-                    else:
-                        result["phase3_status"] = check_cache_status(r3.headers)
-                except requests.RequestException:
-                    result["phase3_status"] = "ERROR"
-                    result["has_error"] = True
 
     clear_vary_cookie(session)
     return result
@@ -275,7 +312,8 @@ def compute_stats(results) -> dict:
     stats = {"guest_hit": 0, "guest_miss": 0, "full_hit": 0, "full_miss": 0,
              "mobile_guest_hit": 0, "mobile_guest_miss": 0,
              "mobile_full_hit": 0, "mobile_full_miss": 0,
-             "errors": 0, "vary_ok": 0, "no_vary": 0, "rate_limited": 0}
+             "errors": 0, "vary_ok": 0, "no_vary": 0, "rate_limited": 0,
+             "vary_off": 0, "guest_on": 0, "guest_off": 0, "mobile_shared": 0}
     for r in results:
         for key, prefix in (
             ("phase1_status", "guest"),
@@ -291,6 +329,14 @@ def compute_stats(results) -> dict:
             stats["vary_ok"] += 1
         if r["no_vary"]:
             stats["no_vary"] += 1
+        if r["phase2_status"] == "OFF":
+            stats["vary_off"] += 1
+        if r.get("guest_mode") is True:
+            stats["guest_on"] += 1
+        elif r.get("guest_mode") is False:
+            stats["guest_off"] += 1
+        if r.get("mobile_shared"):
+            stats["mobile_shared"] += 1
         if r["has_error"]:
             stats["errors"] += 1
         if r["got_429"]:
