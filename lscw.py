@@ -7,11 +7,11 @@ Usage:
     python3 lscw.py --site https://yoursite.com --resume
     python3 lscw.py --site https://yoursite.com --delay X --workers X
     python3 lscw.py --site https://yoursite.com --sitemap https://yoursite.com/sitemap.xml
-    python3 lscw.py --site https://yoursite.com --sitemap-ua browser
+    python3 lscw.py --site https://yoursite.com --vary off --no-mobile
     python3 lscw.py --site https://yoursite.com --urls-file urls.txt --dry-run
 
 Requirements:
--- pip install requests rich
+-- pip install -r requirements.txt   (requests; rich and brotli are optional)
 """
 
 import sys
