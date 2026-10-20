@@ -1,0 +1,9 @@
+# Required
+requests>=2.28
+
+# Optional: live dashboard (plain-text output without it)
+rich>=13
+
+# Optional: lets LSCW accept brotli-compressed responses.
+# Use brotlicffi where no prebuilt brotli wheel exists for your Python.
+# brotli>=1.1

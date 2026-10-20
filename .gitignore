@@ -5,3 +5,7 @@ __pycache__/
 # LSCW runtime files
 .lscache_*.checkpoint.json
 .lscache_*.checkpoint.json.tmp
+
+# Virtual environments
+.venv/
+venv/
