@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import requests
@@ -173,6 +176,15 @@ class AcceptEncodingTests(unittest.TestCase):
             self.assertFalse(config._brotli_available())
         with mock.patch.object(config, "find_spec", side_effect=lambda n: object() if n == "brotlicffi" else None):
             self.assertTrue(config._brotli_available())
+
+
+class OptionalRichTests(unittest.TestCase):
+    def test_cli_starts_without_rich(self):
+        # Rich is optional: the plain-text UI must load when it is missing.
+        code = "import sys; sys.modules['rich'] = None; import lscw.cli, lscw.runner"
+        root = Path(__file__).resolve().parent.parent
+        done = subprocess.run([sys.executable, "-c", code], cwd=root, capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
 
 
 if __name__ == "__main__":

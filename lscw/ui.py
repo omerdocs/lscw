@@ -23,6 +23,8 @@ try:
 except ImportError:
     RICH_AVAILABLE = False
     console = None  # type: ignore[assignment]
+    # runner.py imports Live unconditionally; it is only used when Rich is present.
+    Live = None  # type: ignore[assignment,misc]
 
 ACCENT = "cyan"
 BORDER = "bright_black"
