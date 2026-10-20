@@ -33,7 +33,7 @@ def run_warming(
     total = len(urls)
     live_stats = {"guest_hit": 0, "guest_miss": 0, "full_hit": 0, "full_miss": 0,
                   "m_guest_hit": 0, "m_guest_miss": 0, "m_full_hit": 0, "m_full_miss": 0,
-                  "errors": 0, "vary_ok": 0, "no_vary": 0}
+                  "errors": 0, "vary_ok": 0, "no_vary": 0, "vary_off": 0, "m_shared": 0}
     recent_rows: list[dict] = []
     start_time = time.time()
     lock = Lock()
@@ -53,6 +53,8 @@ def run_warming(
             elif mf == "MISS":          live_stats["m_full_miss"] += 1
             if result["guest_vary_ok"]: live_stats["vary_ok"] += 1
             if result["no_vary"]:       live_stats["no_vary"] += 1
+            if p2 == "OFF":             live_stats["vary_off"] += 1
+            if result["mobile_shared"]: live_stats["m_shared"] += 1
             if result["has_error"]:     live_stats["errors"] += 1
             all_results.append(result)
             recent_rows.append(result)
@@ -76,6 +78,7 @@ def run_warming(
                 warm_mobile=args.mobile,
                 timeout=args.timeout,
                 delay_between_phases=args.phase_delay,
+                vary_mode=args.vary,
             )
             result["_idx"] = i
             _record(result)
@@ -105,6 +108,7 @@ def run_warming(
                 warm_mobile=args.mobile,
                 timeout=args.timeout,
                 delay_between_phases=args.phase_delay,
+                vary_mode=args.vary,
             )
             r["_idx"] = idx
             return r

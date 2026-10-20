@@ -121,6 +121,7 @@ def _status_cell(s: str) -> "Text":
     if s == "SKIP":       return Text("–",        style="dim")
     if s == "NO-CACHE":   return Text("no-cache", style="dim red")
     if s == "NO-VARY":    return Text("no-vary",  style="dim yellow")
+    if s == "OFF":        return Text("off",      style="dim")
     if s == "EXT-REDIR":  return Text("ext →",    style="dim")
     if s == "ERROR":      return Text("error",    style="bold red")
     if s.startswith("E") and s[1:].isdigit():
@@ -146,7 +147,10 @@ def _results_table(rows: list[dict]) -> "Table":
     t.add_column("vary",     width=4,  justify="center")
 
     for r in rows:
-        vary = Text("✓", style="green") if r["guest_vary_ok"] else Text("✗", style="dim red")
+        if r["phase2_status"] == "OFF":
+            vary = Text("–", style="dim")
+        else:
+            vary = Text("✓", style="green") if r["guest_vary_ok"] else Text("✗", style="dim red")
         t.add_row(
             str(r.get("_idx", "?")),
             Text(short_url(r["url"])),
@@ -175,7 +179,8 @@ def build_live_view(progress, rows: list[dict], stats: dict, elapsed: float, del
     sgrid.add_row(
         "desktop", f"guest {_hitmiss(stats['guest_hit'], stats['guest_miss'])}"
                    f"   full {_hitmiss(stats['full_hit'], stats['full_miss'])}",
-        "vary",    f"[green]{stats['vary_ok']} ✓[/]  [yellow]{stats['no_vary']} missing[/]",
+        "vary",    f"[green]{stats['vary_ok']} ✓[/]  [yellow]{stats['no_vary']} missing[/]"
+                   + (f"  [dim]{stats['vary_off']} off[/]" if stats.get("vary_off") else ""),
     )
     sgrid.add_row(
         "mobile",  f"guest {_hitmiss(stats['m_guest_hit'], stats['m_guest_miss'])}"
@@ -207,7 +212,10 @@ def build_live_view(progress, rows: list[dict], stats: dict, elapsed: float, del
 
 
 def plain_result_line(result: dict, idx: int, total: int) -> str:
-    gv = "✓" if result["guest_vary_ok"] else "✗"
+    if result["phase2_status"] == "OFF":
+        gv = "–"
+    else:
+        gv = "✓" if result["guest_vary_ok"] else "✗"
     return (
         f"  [{idx:4d}/{total}] {short_url(result['url'], 50):<50} "
         f"| {result['phase1_status']:<8} | {gv:^5} "
@@ -232,8 +240,16 @@ def print_summary(stats: dict, total: int, elapsed: float, retried: int = 0) -> 
                                    f"     full {_hitmiss(stats['mobile_full_hit'], stats['mobile_full_miss'])}")
         g.add_row("", "")
         nv = stats["no_vary"]
-        g.add_row("vary keys",     f"[green]{stats['vary_ok']} obtained[/]"
-                                   + (f" · [yellow]{nv} missing[/]" if nv else " [dim]· 0 missing[/]"))
+        if stats.get("vary_off", 0) >= total and total:
+            g.add_row("vary keys",     "[dim]skipped · vary phases off[/]")
+        else:
+            g.add_row("vary keys",     f"[green]{stats['vary_ok']} obtained[/]"
+                                       + (f" · [yellow]{nv} missing[/]" if nv else " [dim]· 0 missing[/]")
+                                       + (f" [dim]· {stats['vary_off']} off[/]" if stats.get("vary_off") else ""))
+        if stats.get("guest_on") or stats.get("guest_off"):
+            g.add_row("guest mode",    f"detected on {stats.get('guest_on', 0)} [dim]· not on {stats.get('guest_off', 0)}[/]")
+        if stats.get("mobile_shared"):
+            g.add_row("mobile copy",   f"[dim]shared with desktop on[/] {stats['mobile_shared']} [dim]urls[/]")
         if stats.get("rate_limited"):
             g.add_row("rate limited", f"[yellow]{stats['rate_limited']} responses (HTTP 429)[/]")
         if retried:
@@ -260,7 +276,12 @@ def print_summary(stats: dict, total: int, elapsed: float, retried: int = 0) -> 
               f"  ·  full HIT {stats['full_hit']} MISS {stats['full_miss']}")
         print(f"  mobile        guest HIT {stats['mobile_guest_hit']} MISS {stats['mobile_guest_miss']}"
               f"  ·  full HIT {stats['mobile_full_hit']} MISS {stats['mobile_full_miss']}")
-        print(f"  vary keys     {stats['vary_ok']} obtained · {stats['no_vary']} missing")
+        print(f"  vary keys     {stats['vary_ok']} obtained · {stats['no_vary']} missing"
+              f" · {stats.get('vary_off', 0)} off")
+        if stats.get("guest_on") or stats.get("guest_off"):
+            print(f"  guest mode    detected on {stats.get('guest_on', 0)} · not on {stats.get('guest_off', 0)}")
+        if stats.get("mobile_shared"):
+            print(f"  mobile copy   shared with desktop on {stats['mobile_shared']} urls")
         if stats.get("rate_limited"):
             print(f"  rate limited  {stats['rate_limited']} responses (HTTP 429)")
         if retried:
