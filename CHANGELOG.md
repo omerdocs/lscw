@@ -6,6 +6,7 @@ All notable changes to LSCW are listed here. Versions follow [Semantic Versionin
 
 ### Fixed
 - **Sites without LiteSpeed Guest Mode no longer get uncached page renders.** `guest.vary.php` hands out a guest vary cookie even when Guest Mode is off, but LiteSpeed never stores requests carrying it — so on those sites (LiteSpeed's default) every desktop and mobile "full" request was a full, uncached page render that warmed nothing. Measured on a shared host: 6 requests and ~34 s per URL before, 1–2 requests and ~1.5 s per URL now.
+- LSCW no longer crashes on start when `rich` isn't installed (`ImportError: cannot import name 'Live'`, present since 1.1.0). `rich` is optional again, as documented.
 - `Accept-Encoding` advertises `br` only when `brotli` or `brotlicffi` is installed. Without a decoder a brotli-compressed body couldn't be read, which silently broke the HTML inspection (inline vary value, Guest Mode check).
 
 ### Added
